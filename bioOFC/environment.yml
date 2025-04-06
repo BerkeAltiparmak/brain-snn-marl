@@ -1,4 +1,4 @@
-name: snnOFC
+name: neuralOFC
 channels:
   - defaults
 dependencies:
@@ -6,4 +6,3 @@ dependencies:
   - numpy
   - python
   - scipy
-  - jupyterlab
