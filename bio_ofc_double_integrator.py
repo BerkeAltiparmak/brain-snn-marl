@@ -51,3 +51,23 @@ class BioOFCDI2:
                 xhat=xhat_next; xhat_hist.append(xhat.copy()); u_hist.append(u.copy()); e_hist.append(e.copy())
             mse.append(ms/T)
         return np.array(mse), self.A, self.B, self.C
+    def controller_learning(self, episodes=120, T=20):
+        costs=[]; self.Z[:]=0; self.G[:]=0
+        for ep in range(episodes):
+            x = col([-1.0,0.0]); xhat=x.copy(); csum=0.0
+            for t in range(T):
+                y = C_true @ x + col(np.random.multivariate_normal(np.zeros(2), W))
+                e = y - self.C @ xhat
+                xi = col(np.random.randn(1)*self.sigma)
+                u = - self.K @ xhat - xi
+                xhat_next = self.A@xhat + self.B@u + self.L@e
+                v = col(np.random.multivariate_normal(np.zeros(2), V))
+                x = A_true@x + B_true@u + v
+                c = float((x.T@Q@x + R*(u.T@u)).squeeze()); csum += c
+                self.Z += xi @ xhat.T
+                self.G = self.momentum*self.G + c*self.Z
+                self.K -= self.lr_K*self.G
+                clip_matrix(self.K, 1.0)
+                xhat = xhat_next
+            costs.append(csum / T)
+        return np.array(costs)
