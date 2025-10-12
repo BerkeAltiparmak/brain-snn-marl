@@ -71,3 +71,17 @@ class BioOFCDI2:
                 xhat = xhat_next
             costs.append(csum / T)
         return np.array(costs)
+    def evaluate(self, trials=10, T=20):
+        tot=0.0
+        for _ in range(trials):
+            x = col([-1.0,0.0]); xhat=x.copy(); c=0.0
+            for t in range(T):
+                y = C_true @ x + col(np.random.multivariate_normal(np.zeros(2), W))
+                e = y - self.C @ xhat
+                u = - self.K @ xhat
+                xhat = self.A@xhat + self.B@u + self.L@e
+                v = col(np.random.multivariate_normal(np.zeros(2), V))
+                x = A_true@x + B_true@u + v
+                c += float((x.T@Q@x + R*(u.T@u)).squeeze())
+            tot += c / T
+        return tot/trials
