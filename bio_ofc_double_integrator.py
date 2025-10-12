@@ -27,3 +27,27 @@ class BioOFCDI2:
         self.alpha_A = 1e-3; self.alpha_B = 1e-3; self.alpha_C = 1e-3; self.alpha_L = 5e-3
         self.lr_K = 1e-4; self.momentum = 0.9; self.sigma = 0.05
         self.Z = np.zeros((1,2)); self.G = np.zeros((1,2))
+    def open_loop_id(self, episodes=60, T=20):
+        mse=[]
+        for ep in range(episodes):
+            x = col([-1.0,0.0]); xhat = x.copy()
+            xhat_hist=[xhat.copy()]; u_hist=[np.zeros((1,1))]; e_hist=[np.zeros((2,1))]
+            ms=0.0
+            for t in range(T):
+                y = C_true @ x + col(np.random.multivariate_normal(np.zeros(2), W))
+                e = y - self.C @ xhat
+                u = col(np.random.randn(1)*0.1)
+                xhat_next = self.A@xhat + self.B@u + self.L@e
+                if t>=1:
+                    x_tau=xhat_hist[-1]; u_tau=u_hist[-1]; e_tau=e_hist[-1]; Le=self.L@e
+                    self.A += self.alpha_A*(Le@x_tau.T)
+                    self.B += self.alpha_B*(Le@u_tau.T)
+                    self.L += self.alpha_L*(Le@e_tau.T)
+                    self.C += self.alpha_C*(e@xhat_next.T)
+                    #clip_matrix(self.A,2.0); clip_matrix(self.B,2.0); clip_matrix(self.C,2.0); clip_matrix(self.L,2.0)
+                v = col(np.random.multivariate_normal(np.zeros(2), V))
+                x = A_true@x + B_true@u + v
+                ms += float((e.T@e).squeeze())
+                xhat=xhat_next; xhat_hist.append(xhat.copy()); u_hist.append(u.copy()); e_hist.append(e.copy())
+            mse.append(ms/T)
+        return np.array(mse), self.A, self.B, self.C
