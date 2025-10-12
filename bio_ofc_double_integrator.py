@@ -85,3 +85,18 @@ class BioOFCDI2:
                 c += float((x.T@Q@x + R*(u.T@u)).squeeze())
             tot += c / T
         return tot/trials
+
+if __name__ == "__main__":
+    agent = BioOFCDI2(tau=5)
+    mse, A_hat, B_hat, C_hat = agent.open_loop_id(episodes=500, T=20)
+    costs = agent.controller_learning(episodes=500, T=20)
+    avg_cost = agent.evaluate(trials=10, T=20)
+    print("ID MSE last-10 avg:", np.mean(mse[-10:]))
+    print("A_hat:", A_hat)
+    print("B_hat:", B_hat)
+    print("C_hat:", C_hat)
+    print("Controller cost last-10 avg:", np.mean(costs[-10:]))
+    print("Deterministic cost:", avg_cost)
+    import matplotlib.pyplot as plt
+    plt.figure(); plt.plot(mse); plt.xlabel("Episode"); plt.ylabel("Prediction MSE"); plt.title("System ID: MSE"); plt.ylim(0, 10); plt.tight_layout(); plt.show()
+    plt.figure(); plt.plot(costs); plt.xlabel("Episode"); plt.ylabel("Total cost"); plt.title("Controller: cost"); plt.ylim(0, 10000); plt.tight_layout(); plt.show()
