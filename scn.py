@@ -1,353 +1,434 @@
-"""
-Spiking LQG via Spike Coding Networks (SCN): Closed-form scaffold
--------------------------------------------------------------------
-Implements the voltage dynamics and weight blocks from the paper:
-- Fast term:   Ω_f = - D^T D                               (instantaneous reset on spikes)
-- Slow term:   Ω_s = D_x^T (A + λ I) D_x
-- Kalman:      Ω_k = - D_x^T K_f C D_x,   F_k = D_x^T K_f
-- Control:     Ω_c = - D_x^T B K_c D_x,   Ω_z = D_x^T B K_c D_z
-- Readouts:    x̂ = D_x r, ẑ = D_z r,    u = D_u r with D_u = -K_c (D_x - D_z)
-- Target repr: D_z^T (ż + λ z)
-
-A simple spring–mass–damper (SMD) demo is provided at the bottom.
-"""
-
-from dataclasses import dataclass
 import numpy as np
-from numpy.random import default_rng
-from scipy.linalg import solve_continuous_are
-import matplotlib.pyplot as plt
+import control
+
+def FE_init(time,dt):
+    """Initialization of Forward Euler.
+    Given simulation time (seconds) and timestep size (dt), returns list of times (for looping purposes) and the number of total timesteps (Nt).
+
+    Args:
+        time (integer): the number of seconds to run the FE simulation for, in seconds.
+        dt (float): the length of a single timestep, in seconds.
+
+    Returns:
+        ndarray: array of times to loop over, or for plotting purposes.
+        int: the total number of timesteps in the 
+    """    
+    #Forward Euler parameters
+    times = np.arange(0, time, dt)
+    Nt=len(times)
+
+    return times,Nt
+
+"""
+Initialization of SMD system.
+Given m, k and c (SMD parameters), returns A and B matrices for SMD system in state-space form.
+"""
+def SMD_init(m=3,k=5,c=0.5):
+
+    #A-matrix, defines dynamics of the DS
+    A = np.array([[0,1],
+            [(-k/m),(-c/m)]]) 
+
+    #B-matrix, defines the influence of the force on the system
+    B = np.array([[0],[1/m]]) 
+
+    #Check controllability 
+    print("Rank of controllability-matrix:", np.linalg.matrix_rank(control.ctrb(A,B)))
+
+    return A,B
+
+"""
+Initialization of Cartpole system.
+Given cartpole parameters, returns A and B matrices for cartpole in state-space form.
+"""
+def Cartpole_init(m = 1,M = 5,L = 2,g = -10,d = 1,s = 1):
+
+    #A-matrix, defines dynamics of the DS
+    A = np.array([[0,1,0,0],
+              [0,(-d/M),(-m*g/M),0],
+              [0,0,0,1],
+              [0,(-s*d/(M*L)),(-s*(m+M)*g/(M*L)),0]])
+
+    #B-matrix, defines the influence of the force on the system
+    B = np.array([[0],[(1/M)],[0],[(s*1/(M*L))]])
+
+    #Check controllability 
+    print("Rank of controllability-matrix:", np.linalg.matrix_rank(control.ctrb(A,B)))
+
+    return A,B
+
+"""
+Initialization of LQR gain matrix.
+Given A and B matrices, as well as LQR parameters Q and R, returns LQR gain matrix Kc. 
+"""
+def Control_init(A,B,Q,R):
+
+    #LQR gain matrix calculation
+    Kc,_,_ = control.lqr(A,B,Q,R)
+
+    return Kc
+
+"""
+Initialization of Kalman filter gain matrix.
+Given A and C matrices, as well as covariance parameters for disturbance and noise, returns Kalman filter gain matrix Kf.
+"""
+def Kalman_init(A,C,Vn_cov=0.001,Vd_cov=0.001):
+
+    #Covariance matrices
+    Vd = Vd_cov*np.identity(len(A))  # disturbance covariance
+    Vn = Vn_cov*np.identity(len(A))    # noise covariance
+
+    #Kalman filter gain matrix calculation
+    Kf_t,_,_=control.lqr(np.transpose(A),np.transpose(C),Vd,Vn)
+    Kf=np.transpose(Kf_t)
+    return Kf
+
+"""
+Initialization of state matrix X.
+Given the starting state x0 and FE parameter Nt, returns X, a zero-matrix which keeps track of the system state.
+"""
+def X_init(x0,Nt):
+    #Initialization of 'real system'
+    X=np.zeros([len(x0),Nt+1])
+    X[:,0]=x0
+
+    return X
+
+"""
+Initialization of Kalman Filter SCN.
+Given the SCN and FE parameters, returns SCN states with connections.
+"""
+def KfSCN_init(K,Nt,A,B,C,Kf,N=100,lam=0.1,bounding_box_factor=10,zero_init=True,x0=None,seed=0):
+
+    np.random.seed(seed)
+
+    D=np.random.randn(K,N) # N x K - Weights associated to each neuron
+    D=D/np.linalg.norm(D,axis=0) #normalize
+    D = D / bounding_box_factor # avoid too big discontinuities
+    T = np.diag(D.T@D)/2
+
+    # Initialize Voltage, spikes, rate
+    V = np.zeros([N,Nt+1])
+    s = np.zeros([N,Nt+1])
+    r = np.zeros([N,Nt+1])
+
+    # Set initial conditions
+    if not zero_init:
+        r[:,0] = np.array(np.linalg.pinv(D)@x0) # pseudo-inverse - "cheaty" way of getting the right firing rate
+        V[:,0] = D.T@(x0-D@r[:,0])
+
+    # Network connections:
+    # - fast
+    O_f = D.T @ D
+    # - slow
+    O_s = D.T @ (lam*np.identity(K) + A) @ D
+    # - external input
+    F_i = D.T @ B
+    # - rec. kalman
+    O_k = -D.T @ Kf @ C @ D
+    # - ff kalman
+    F_k = D.T @ Kf
+
+    return D,T,V,s,r,O_f,O_s,F_i,O_k,F_k
+
+"""
+Initialization of SCN Controller.
+Given the SCN and FE parameters, returns SCN states with connections.
+"""
+def ControllerSCN_init(K,Nt,A,B,C,Kf,Kc,N=100,lam=0.1,bounding_box_factor=10,zero_init=True,x0=None,seed=0):
+
+    np.random.seed(seed)
+
+    D=np.random.randn(K,N) # N x K - Weights associated to each neuron
+    D=D/np.linalg.norm(D,axis=0) #normalize
+    D = D / bounding_box_factor # avoid too big discontinuities
+    T = np.diag(D.T@D)/2
+
+    # Initialize Voltage, spikes, rate
+    V = np.zeros([N,Nt+1])
+    s = np.zeros([N,Nt+1])
+    r = np.zeros([N,Nt+1])
+
+    # Set initial conditions
+    if not zero_init:
+        r[:,0] = np.array(np.linalg.pinv(D)@x0) # pseudo-inverse - "cheaty" way of getting the right firing rate
+        V[:,0] = D.T@(x0-D@r[:,0])
+
+    #We require an index for the weights, as the connections are only relevant for the first K/2 weights (the rest are for encoding the target state)
+    i=int(K/2)
+
+    # Network connections:
+    # - fast
+    O_f = D[:-i].T @ D[:-i]
+    # - slow
+    O_s = D[:-i].T @ (lam*np.identity(i) + A) @ D[:-i]
+    # - rec. control
+    O_c = -D[:-i].T @ B @ Kc @ D[:-i]
+    # - ff. control
+    F_c = D[:-i].T @ B @ Kc
+    # - rec. kalman
+    O_k = D[:-i].T @ Kf @ C @ D[:-i]
+    # - ff kalman
+    F_k = -D[:-i].T @ Kf
+
+    return D,T,V,s,r,O_f,O_s,O_c,F_c,O_k,F_k
+
+"""
+Initialization of the Kf loop.
+Given parameters, returns other matrices which are of importance in the estimation loop, such as the observation matrix Y, noise matrices, control matrix U. 
+Also returns X_hat and X_hat_fe, the matrices which keep track of the Kf estimation for both the SCN and the idealized KF respectively.
+"""
+def KfLoop_init(X,A,B,C,x0,Nt,Vd_cov,Vn_cov):
+
+    U = np.zeros([B.shape[1],Nt+1])
+    Y = np.zeros([C.shape[0],Nt+1])
+    X_hat = np.zeros([len(x0),Nt+1])
+    X_hat_fe = np.zeros([len(x0),Nt+1])
+    
+    Vd = Vd_cov*np.identity(len(A))
+    Vn = Vn_cov*np.identity(len(A))
+
+    uDIST = np.random.multivariate_normal(np.zeros(len(A)),Vd,Nt+1).T
+    uNOISE = np.random.multivariate_normal(np.zeros(len(A)),Vn,Nt+1).T
+
+    Y[:,0] = C@X[:,0] + uNOISE[:,0]
+
+    return U,Y,X_hat,X_hat_fe,uDIST,uNOISE
+
+"""
+Initialization of the Control loop.
+Given parameters, returns other matrices which are of importance in the control loop, such as the observation matrix Y, noise matrices, control matrix U. 
+Also returns X_hat and X_hat_fe, the matrices which keep track of the controller estimation for both the SCN and the idealized controller respectively.
+"""
+def ControlLoop_init(X,X_2,error_scn,error_ideal,x_des,dt,A,B,C,x0,Nt,Vd_cov,Vn_cov):
+
+    U = np.zeros([B.shape[1],Nt+1])
+    Y = np.zeros([C.shape[0],Nt+1])
+    
+    U_2 = np.zeros([B.shape[1],Nt+1])
+    Y_2 = np.zeros([C.shape[0],Nt+1])
+    
+    X_hat = np.zeros([len(x0),Nt+1])
+    X_hat_fe = np.zeros([len(x0),Nt+1])
+    
+    Vd = Vd_cov*np.identity(len(A))
+    Vn = Vn_cov*np.identity(len(A))
+
+    uDIST = np.random.multivariate_normal(np.zeros(len(A)),Vd,Nt+1).T
+    uNOISE = np.random.multivariate_normal(np.zeros(len(A)),Vn,Nt+1).T
+
+    Y[:,0] = C@X[:,0] + uNOISE[:,0]
+    Y_2[:,0] = C@X_2[:,0] + uNOISE[:,0]
+    
+    Dx=np.gradient(x_des,axis=1)/dt
+    
+    error_scn[:,0] = np.abs(X[:,0]-x_des[:,0])
+    error_ideal[:,0] = np.abs(X_2[:,0]-x_des[:,0])
+
+    return U,Y,U_2,Y_2,X_hat,X_hat_fe,uDIST,uNOISE,Dx,error_scn,error_ideal
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+import numpy as np
 
-def make_random_decoders(K: int, N: int, rng, col_norm: float = 1.0):
-    """D in R^{K x N}. Columns ~ N(0, I) then normalized to 'col_norm'."""
-    D = rng.normal(size=(K, N))
-    norms = np.linalg.norm(D, axis=0, keepdims=True) + 1e-12
-    D = D / norms * col_norm
-    return D
+"""
+Function for running a single step of the SCN Kalman filter network.
+"""
+def run_KfSCN_step(y,u,r,s,v,D,T,lam,O_f,O_s,F_i,O_k,F_k,C,t,dt,sigma):
 
-def continuous_lqe(A, C, Sigma_d, Sigma_n):
-    """
-    Continuous-time Kalman gain (LQE): K_f = P_e C^T Σ_n^{-1},
-    where P_e solves: A P + P A^T - P C^T Σ_n^{-1} C P + Σ_d = 0
-    """
-    # CARE on estimator in "dual" form: A^T, C^T, etc.
-    # SciPy solves: A^T P + P A - P C^T R^{-1} C P + Q = 0  -> with Q=Σ_d, R=Σ_n
-    P = solve_continuous_are(A.T, C.T, Sigma_d, Sigma_n)
-    Kf = (P @ C.T) @ np.linalg.inv(Sigma_n)
-    return Kf, P
+    # Calculating the voltages at time t+1
+    dvdt = -lam * v - O_f @ s + O_s @ r + F_i @ u + (O_k @ r + F_k @ C @ y)
+    v_next = v + dvdt*dt + np.sqrt(dt)*sigma*np.random.randn(len(dvdt))
 
-def continuous_lqr(A, B, Q, R):
-    """
-    Continuous-time LQR: u = -K_c x, K_c = R^{-1} B^T P_c,
-    where P_c solves: A^T P + P A - P B R^{-1} B^T P + Q = 0
-    """
-    P = solve_continuous_are(A, B, Q, R)
-    Kc = np.linalg.inv(R) @ (B.T @ P)
-    return Kc, P
+    # check if there are neurons whose voltage is above threshold
+    above = np.where(v_next > T)[0]
 
+    # introduce a control to let only one neuron fire at the time
+    s_next=np.zeros(s.shape)
+    if len(above):
+        s_next[np.argmax(v_next)] = 1/dt
 
-# -----------------------------
-# Data classes for clarity
-# -----------------------------
+    # update rate
+    drdt = s_next - lam*r
+    r_next = r + drdt*dt
+    
+    return r_next, s_next, v_next
 
-@dataclass
-class Plant:
-    A: np.ndarray     # (K x K)
-    B: np.ndarray     # (K x U)
-    C: np.ndarray     # (M x K)
-    Sigma_d: np.ndarray  # (K x K) process noise cov (continuous)
-    Sigma_n: np.ndarray  # (M x M) measurement noise cov (continuous)
+"""
+Function for running a single step of the SCN controller.
+"""
+def run_SCNcontrol_step(y,x_des,Dx,r,s,v,D,T,lam,Kc,O_f,O_s,O_c,F_c,O_k,F_k,B,C,t,dt,sigma):
+    
+    #We require an index for the weights, as the connections are only relevant for the first B weights (the rest are for encoding the target state)
+    i=len(B)
+    
+    u_next = -Kc @ (D[:-i] @ r - D[i:] @ r)
 
-@dataclass
-class LQG:
-    Kf: np.ndarray    # (K x M)
-    Kc: np.ndarray    # (U x K)
+    # Calculating the voltages at time t+1
+    dvdt = -lam * v - O_f @ s + O_s @ r + (O_c @ r + F_c @ D[i:] @ r) - (O_k @ r + F_k @ C @ y)
+    dvdt = dvdt + (D[i:].T @ ((lam*x_des)+Dx)) - (D[i:].T @ D[i:] @ s)
+    v_next = v + dvdt*dt + np.sqrt(dt)*sigma*np.random.randn(len(dvdt))
 
-@dataclass
-class SCNWeights:
-    # N neurons, K state dim, M output dim, U control dim
-    Omega_f_x: np.ndarray  # (N x N)
-    Omega_f_z: np.ndarray  # (N x N)
-    Omega_s:   np.ndarray  # (N x N)
-    Omega_k:   np.ndarray  # (N x N)
-    F_k:       np.ndarray  # (N x M)
-    Omega_c:   np.ndarray  # (N x N)
-    Omega_z:   np.ndarray  # (N x N)
-    D_x:       np.ndarray  # (K x N)
-    D_z:       np.ndarray  # (K x N)
-    D_u:       np.ndarray  # (U x N)
-    T:         np.ndarray  # (N,) thresholds
+    # check if there are neurons whose voltage is above threshold
+    above = np.where(v_next > T)[0]
 
+    # introduce a control to let only one neuron fire at the time
+    s_next=np.zeros(s.shape)
+    if len(above):
+        s_next[np.argmax(v_next)] = 1/dt
 
-# -----------------------------
-# Closed-form construction
-# -----------------------------
+    # update rate
+    drdt = s_next - lam*r
+    r_next = r + drdt*dt
+    
+    return r_next, s_next, v_next, u_next
 
-def build_scn_weights(plant: Plant, lqg: LQG, N: int, lam: float, rng, col_norm=1.0) -> SCNWeights:
-    """
-    Build all weight blocks as in the paper, for a shared population that
-    jointly represents x̂ and ẑ with separate decoders D_x and D_z.
-    """
-    A, B, C = plant.A, plant.B, plant.C
-    Kf, Kc = lqg.Kf, lqg.Kc
-    K, U = A.shape[0], B.shape[1]
-    M = C.shape[0]
+"""
+Function for running a single step of the idealized Kalman filter.
+"""
+def run_Kfidealized_step(x_hat,A,B,u,Kf,y,C,dt):
 
-    # Decoders (K x N)
-    D_x = make_random_decoders(K, N, rng, col_norm=col_norm)
-    D_z = make_random_decoders(K, N, rng, col_norm=col_norm)
+    dxdt = A@x_hat + B@u + Kf@(y-(C@x_hat))
+    x_next = x_hat + dxdt*dt
+    
+    return x_next
 
-    # Fast lateral terms (instantaneous resets on spikes)
-    Omega_f_x = - D_x.T @ D_x                      # (N x N)
-    Omega_f_z = - D_z.T @ D_z                      # (N x N)
+"""
+Function for running a single step of a linearized Dynamical System (DS).
+"""
+def run_DSlinearized_step(x,A,B,u,dist,dt):
+    
+    dxdt = A@x + B@u 
+    x_next = x + dxdt*dt + np.sqrt(dt)*dist
+    
+    return x_next
 
-    # Slow term implements (A + λ I) on the x̂ readout
-    Omega_s = D_x.T @ (A + lam * np.eye(K)) @ D_x  # (N x N)
+"""
+Function for running a single step of a (non-linear) simulated Cartpole Dynamical System.
+"""
+def run_Cartpolereal_step(x,u,dist,m,M,L,g,d,dt):
+    Sy=np.sin(x[2])
+    Cy=np.cos(x[2])
 
-    # Kalman innovation injection: D_x^T Kf (y - C x̂)
-    F_k = D_x.T @ Kf                               # (N x M)
-    Omega_k = - D_x.T @ Kf @ C @ D_x               # (N x N)
+    D = m*L*L*(M+m*(1-Cy**2))
+    
+    dy_1 = x[1]
+    dy_2 = (1/D)*(-m**2*L**2*g*Cy*Sy + m*L**2*(m*L*x[3]**2*Sy - d*x[1])) + m*L*L*(1/D)*u
+    dy_3 = x[3]
+    dy_4 = (1/D)*((m+M)*m*g*L*Sy - m*L*Cy*(m*L*x[3]**2*Sy - d*x[1])) - m*L*Cy*(1/D)*u
+    
+    dxdt=np.array([dy_1, dy_2, dy_3, dy_4])
 
-    # Control effect after substituting u = -Kc (x̂ - ẑ)
-    # Split into Ω_c r + Ω_z r = D_x^T B (-Kc D_x + Kc D_z) r
-    Omega_c = - D_x.T @ B @ Kc @ D_x               # (N x N)
-    Omega_z =   D_x.T @ B @ Kc @ D_z               # (N x N)
-
-    # Control readout (U x N)
-    D_u = - Kc @ (D_x - D_z)
-
-    # Spike thresholds: T_i = 0.5 (||D_x[:,i]||^2 + ||D_z[:,i]||^2)
-    Tx = np.sum(D_x * D_x, axis=0)
-    Tz = np.sum(D_z * D_z, axis=0)
-    T  = 0.5 * (Tx + Tz)
-
-    return SCNWeights(
-        Omega_f_x=Omega_f_x, Omega_f_z=Omega_f_z, Omega_s=Omega_s,
-        Omega_k=Omega_k, F_k=F_k, Omega_c=Omega_c, Omega_z=Omega_z,
-        D_x=D_x, D_z=D_z, D_u=D_u, T=T
-    )
+    x_next=x+dxdt*dt + np.sqrt(dt)*dist
+    
+    return x_next
 
 
-# -----------------------------
-# Simulation loop
-# -----------------------------
+import numpy as np #Numpy for matrix calculations
+import matplotlib.pyplot as plt #Matplotlib for plotting
+#import initialization, simulation #Helper functions for initialization and simulation are located in these two Python files. Please see the files themselves for more details.
 
-@dataclass
-class SimConfig:
-    dt: float = 5e-4
-    T: float = 4.0
-    lam: float = 10.0
-    max_spikes_per_step: int = 5_000
-    silence_at: float | None = None  # time to silence a fraction of neurons
-    silence_frac: float = 0.0        # 0.3 means silence 30% of neurons
+#Forward Euler parameters
+time = 50 #Total simulation time in seconds
+dt = 0.001 #Length of a single timestep
 
+#Spring-Mass-Damper System parameters
+m = 3 #Mass (in kg)
+k = 5 #Spring constant (in N/m)
+c = 0.5 #Constant of proportionality (dampening, in Ns/m = kg/s)
+x0 = np.array([5, 0]) #Initial state of the SMD system.
 
-def step_target_profile(t, steps=((0.5, 0.2), (2.0, -0.15), (3.0, 0.0))):
-    """
-    Piecewise-constant desired POSITION for SMD (units arbitrary).
-    'steps' is a tuple of (t_switch, level).
-    """
-    level = 0.0
-    for ts, val in steps:
-        if t >= ts:
-            level = val
-    return level
+#Other system parameters
+C = np.array([[1,0],
+              [0,0]]) #Initialization of the C matrix (because y=Cx+noise)
+Vn_cov = 0.001 #Sensor noise covariance (y=Cx+noise)
+Vd_cov = 0.001 #Disturbance noise covariance (noise on the SMD)
 
+#SCN Estimator parameters
+network_size = 20 #The number of neurons in the SCN
+signal_dimensions = 2 #The dimensions of the signal, K (is equal to the size of x0, but can be set manually)
+lam = 0.1 #The leakage constant of the network, lambda
+Vv_sigma = 0.000001 #Voltage noise sigma; noise on the voltage
 
-def run_scn_lqg_smd_demo(N=200, seed=1, cfg: SimConfig = SimConfig()):
-    rng = default_rng(seed)
+#Forward Euler simulation
+times,Nt = FE_init(time,dt) #times is a list of timesteps which we will loop over, Nt is the total number of timesteps (length of times)
 
-    # --- Define the plant: spring–mass–damper in state [x, v]^T
-    m, k, c = 1.0, 20.0, 2.0
-    A = np.array([[0, 1],
-                  [-k/m, -c/m]])
-    B = np.array([[0.0],
-                  [1.0/m]])
-    C = np.array([[1.0, 0.0]])  # observe position only
-    K = A.shape[0]; U = B.shape[1]; M = C.shape[0]
+#SMD System A and B matrices
+A,B = SMD_init(m,k,c) #A and B are the system matrix and input matrix in state-space representation (according to Ax+Bu)
 
-    # Noise covariances (continuous-time interpretation)
-    Sigma_d = np.diag([1e-3, 1e-2])   # process noise
-    Sigma_n = np.diag([1e-3])         # measurement noise
+#Initialization of the Kalman filter gain matrix to be used inside of the SCN estimator and idealized Kalman filter
+Kf = Kalman_init(A,C,Vn_cov,Vd_cov) #From the A and C matrices and noise covariances, we can calculate the Kalman filter gain matrix
 
-    plant = Plant(A=A, B=B, C=C, Sigma_d=Sigma_d, Sigma_n=Sigma_n)
+#Initialization of the state-matrix, containing the states of the simulated SMD system over time
+X = X_init(x0,Nt) #Requires x0 as the first state of the simulated SMD system, and Nt for the matrix dimensions
 
-    # LQG gains
-    Q = np.diag([50.0, 1.0])   # track position (x) strongly, mild penalty on velocity
-    R = np.diag([0.1])         # control effort penalty
-    Kc, Pc = continuous_lqr(A, B, Q, R)
-    Kf, Pe = continuous_lqe(A, C, Sigma_d, Sigma_n)
-    lqg = LQG(Kf=Kf, Kc=Kc)
+#Initializaton of the SCN estimator, given parameters, we calculate D, T, V, s, r and all of the connectivity
+D,T,V,s,r,O_f,O_s,F_i,O_k,F_k = KfSCN_init(signal_dimensions,Nt,A,B,C,Kf,network_size,lam)
 
-    # Build SCN weights
-    W = build_scn_weights(plant, lqg, N=N, lam=cfg.lam, rng=rng, col_norm=1.0)
+#Initialization of other matrices used in simulation, U, Y, X_hat (state matrix of SCN estimator), X_hat_fe (state matrix of idealized Kalman filter), uDIST and uNOISE (noise matrices)
+U,Y,X_hat,X_hat_fe,uDIST,uNOISE = KfLoop_init(X,A,B,C,x0,Nt,Vd_cov,Vn_cov)
 
-    # Precompute
-    dt, Ttot = cfg.dt, cfg.T
-    steps = int(Ttot / dt)
-    tgrid = np.arange(steps) * dt
+def run_simulation(Nt,X,A,B,U,uDIST,dt,Y,C,uNOISE,r,s,V,D,T,lam,O_f,O_s,F_i,O_k,F_k,Vv_sigma,X_hat,X_hat_fe,Kf):
+    #Looping over the entire range of Nt, we have all the timesteps in our simulation
+    for t in range(Nt):
+        #First, simulate one step of the simulated SMD system
+        X[:,t+1] = run_DSlinearized_step(X[:,t],A,B,U[:,t],uDIST[:,t],dt)
 
-    # State variables
-    x = np.zeros(K)                 # plant state
-    v = np.zeros(N)                 # neuron voltages
-    r = np.zeros(N)                 # filtered spikes
-    s = np.zeros(N)                 # spike rates (N/dt) within a time step
-    active = np.ones(N, dtype=bool) # neuron activity mask (for silencing)
+        #Our Kalman filters only have access to Y, which is the partially observable state plus noise
+        Y[:,t+1] = C@X[:,t+1] + uNOISE[:,t+1]
 
-    # Logging
-    X   = np.zeros((steps, K))      # true state
-    Xh  = np.zeros((steps, K))      # estimated x̂ = D_x r
-    U   = np.zeros((steps, U))      # control
-    Y   = np.zeros((steps, M))      # measurement
-    Z   = np.zeros((steps, K))      # target z
-    SPT = []                        # spike raster list of (time_idx, neuron_idx)
+        #Simulate a single step of the SCN Kalman filter
+        r[:,t+1],s[:,t+1],V[:,t+1] = run_KfSCN_step(Y[:,t],U[:,t],r[:,t],s[:,t],V[:,t],D,T,lam,O_f,O_s,F_i,O_k,F_k,C,t,dt,Vv_sigma)
+        
+        #Calculate the state estimated by our SCN Kalman filter by decoding the internal firing rates
+        X_hat[:,t+1] = D@r[:,t+1]
+        
+        #Run a step of the idealized Kalman filter which we compare the SCN to
+        X_hat_fe[:,t+1] = run_Kfidealized_step(X_hat_fe[:,t],A,B,U[:,t],Kf,Y[:,t],C,dt)
 
-    # For target derivative
-    z_prev = np.zeros(K)
+        #We set U to zero, since we are using no outside input in this estimation plot
+        U[0,t+1] = 0
+    
+    return X_hat,X_hat_fe,X,Y,s
 
-    # For silencing
-    silenced = False
-    silence_step = None
-    if cfg.silence_at is not None:
-        silence_step = int(cfg.silence_at / dt)
-
-    # Combined fast reset matrix for shared population
-    Omega_f_total = W.Omega_f_x + W.Omega_f_z
-
-    for t_idx in range(steps):
-        t = tgrid[t_idx]
-
-        # -- Target z(t) in state space: track desired position, zero velocity
-        z_pos = step_target_profile(t)
-        z = np.array([z_pos, 0.0])
-        z_dot = (z - z_prev) / dt   # derivative (zero except at step changes)
-        z_prev = z.copy()
-
-        # -- Readouts
-        x_hat = W.D_x @ r
-        y_hat = C @ x_hat
-
-        # -- Control readout u = D_u r
-        u = (W.D_u @ r).reshape(-1)
-
-        # -- Plant evolution (Euler + noise)
-        # Continuous-time noise ~ N(0, Σ_d * dt)
-        w = rng.multivariate_normal(mean=np.zeros(K), cov=plant.Sigma_d * dt)
-        x = x + dt * (plant.A @ x + plant.B @ u) + w
-        # Measurement with noise (discrete sample)
-        n = rng.multivariate_normal(mean=np.zeros(M), cov=plant.Sigma_n)
-        y = (plant.C @ x) + n
-
-        # -- Voltage dynamics (continuous part)
-        # NOTE: We DO NOT include Ω_f * s here because we apply instantaneous resets
-        # every time a spike occurs (fast term handled explicitly below).
-        dv = (-cfg.lam * v
-              + W.Omega_s @ r
-              + W.Omega_c @ r
-              + W.Omega_z @ r
-              + W.Omega_k @ r
-              + W.F_k @ y
-              + (W.D_z.T @ (z_dot + cfg.lam * z))
-              )
-
-        v = v + dt * dv
-
-        # -- Greedy one-at-a-time spiking with instantaneous fast resets
-        s[:] = 0.0
-        spikes_used = 0
-        # Effective "distance to threshold":
-        delta = v - W.T
-
-        while True:
-            # pick neuron with largest (v_i - T_i)
-            i = np.argmax(delta)
-            if delta[i] <= 0.0 or spikes_used >= cfg.max_spikes_per_step:
-                break
-            if not active[i]:
-                # If silenced, prevent spiking by setting it below threshold and continue
-                delta[i] = -np.inf
-                continue
-
-            # Emit a spike at neuron i
-            s[i] += 1.0 / dt   # so that ∫ s dt = number of spikes
-            SPT.append((t_idx, i))
-
-            # Fast instantaneous reset: v ← v + Ω_f_total * e_i  (add i-th column)
-            v += Omega_f_total[:, i]
-
-            # Update distance to threshold efficiently (only columns change)
-            delta = v - W.T
-            spikes_used += 1
-
-        # -- Filtered spikes r:  ṙ = -λ r + s
-        r = r + dt * (-cfg.lam * r + s)
-
-        # -- Optional neuron silencing at a given time
-        if (not silenced) and (silence_step is not None) and (t_idx >= silence_step):
-            silenced = True
-            num_silence = int(cfg.silence_frac * N)
-            kill_idx = rng.choice(np.where(active)[0], size=num_silence, replace=False)
-            active[kill_idx] = False
-            # Clamp their voltages and filtered spikes
-            v[kill_idx] = 0.0
-            r[kill_idx] = 0.0
-
-        # -- Log
-        X[t_idx]  = x
-        Xh[t_idx] = W.D_x @ r
-        U[t_idx]  = u
-        Y[t_idx]  = y
-        Z[t_idx]  = z
-
-    # ------------- Plots -------------
-    fig, axs = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
-
-    axs[0].plot(tgrid, X[:, 0], label='x (true position)')
-    axs[0].plot(tgrid, Xh[:, 0], label='x̂ (SCN)')
-    axs[0].plot(tgrid, Z[:, 0], label='z (target)', linestyle='--')
-    axs[0].set_ylabel('Position')
-    axs[0].legend(loc='best')
-    axs[0].grid(True)
-
-    axs[1].plot(tgrid, X[:, 1], label='v (true)')
-    axs[1].plot(tgrid, Xh[:, 1], label='v̂ (SCN)')
-    axs[1].set_ylabel('Velocity')
-    axs[1].legend(loc='best')
-    axs[1].grid(True)
-
-    axs[2].plot(tgrid, U[:, 0], label='u')
-    axs[2].set_ylabel('Control')
-    axs[2].legend(loc='best')
-    axs[2].grid(True)
-
-    # Spike raster
-    axs[3].set_ylabel('Neuron idx')
-    axs[3].set_xlabel('Time (s)')
-    if len(SPT) > 0:
-        tt, ii = zip(*SPT)
-        axs[3].scatter(np.array(tt) * dt, np.array(ii), s=1.0)
-    axs[3].grid(True)
-
-    plt.tight_layout()
-    plt.show()
-
-    # Return logs for further analysis if needed
-    return {
-        "t": tgrid, "X": X, "Xh": Xh, "U": U, "Y": Y, "Z": Z,
-        "spikes": np.array(SPT, dtype=int),
-        "weights": W
-    }
+X_hat,X_hat_fe,X,Y,s = run_simulation(Nt,X,A,B,U,uDIST,dt,Y,C,uNOISE,r,s,V,D,T,lam,O_f,O_s,F_i,O_k,F_k,Vv_sigma,X_hat,X_hat_fe,Kf)
 
 
-if __name__ == "__main__":
-    # Example run:
-    cfg = SimConfig(
-        dt=5e-4, T=4.0, lam=10.0,
-        silence_at=2.0, silence_frac=0.3  # silence 30% neurons at t=2s
-    )
-    logs = run_scn_lqg_smd_demo(N=250, seed=7, cfg=cfg)
+fig = plt.figure()
+fig.set_figheight(4)
+fig.set_figwidth(12)
+fig, axs = plt.subplots(3,1, sharex=True, squeeze=True, gridspec_kw = {'hspace':0.1,'height_ratios':[1,1,1]})
+legend_fontsize=12
+
+legend=[]
+axs[0].plot(np.arange(0,time+dt,dt),Y[0],color='#0070C0',alpha=0.7)
+legend.append("Observation")
+#axs[0].plot(np.arange(0,Time+dt,dt),X_hat_fe[0],color='#0000FF',linewidth=3)
+#legend.append("x̂$_{"+str(1)+"}$_FE")
+axs[0].plot(np.arange(0,time+dt,dt),X[0],color='#E3000B')
+legend.append("SMD System")
+axs[0].plot(np.arange(0,time+dt,dt),X_hat[0],color='#00B050')
+legend.append("SCN Estimator")
+
+axs[1].plot(np.arange(0,time+dt,dt),X[1],color='#E3000B')
+axs[1].plot(np.arange(0,time+dt,dt),X_hat[1],color='#00B050')
+fig.legend(legend,fontsize=legend_fontsize,loc='upper right',bbox_to_anchor=(0.90,0.74))
+    
+axs[0].set_ylabel('$x$ $(m)$',fontsize = 12)
+axs[1].set_ylabel('$v$ $(m/s)$',fontsize = 12)
+
+#We use a scatterplot for the spike trains:
+axs[2].scatter(np.nonzero(s)[1]/1000,np.nonzero(s)[0],marker=".",s=0.1,color='black')
+axs[2].set_xlabel('time ($s$)',fontsize = 12)
+axs[2].set_ylabel('neuron nr.',fontsize = 12)
+
+axins = axs[0].inset_axes([0.5, 0.85, 0.4, 0.8])
+range_plot_x,range_plot_y=40000,45000
+axins.plot(np.arange(0,time+dt,dt)[range_plot_x:range_plot_y],Y[0,range_plot_x:range_plot_y],color='#0070C0',alpha=0.7)
+axins.plot(np.arange(0,time+dt,dt)[range_plot_x:range_plot_y],X[0,range_plot_x:range_plot_y],color='#00B050')
+axins.plot(np.arange(0,time+dt,dt)[range_plot_x:range_plot_y],X_hat[0,range_plot_x:range_plot_y],color='#E3000B')
+axins.set_xticklabels([])
+axins.set_yticklabels([])
+
+axs[0].indicate_inset_zoom(axins, edgecolor="black")
+
+plt.show()
